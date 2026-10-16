@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from pgd_qwen import bounded_edit, convergence_metrics, load_unknown_mask, run_inpainting
+from pgd_qwen import (bounded_edit, convergence_metrics, load_unknown_mask,
+                      run_deblurring, run_inpainting)
 
 
 def test_mask_loading_and_bounded_edits():
@@ -86,6 +87,32 @@ def test_malformed_edit_is_rejected():
         raise AssertionError("Malformed Qwen edit was accepted.")
 
 
+def test_deblurring_loop_applies_bounded_qwen_edits():
+    observation = np.full((2, 2, 3), 0.5, dtype=np.float32)
+    calls = []
+
+    def objective(image, observed):
+        return float(np.square(image - observed).sum()), image - observed
+
+    def corrector(**kwargs):
+        calls.append(kwargs["current"].copy())
+        return {
+            "edits": [{"bbox_2d": [0, 0, 1000, 1000], "delta": [8, -8, 4]}],
+            "explanation": "Offline test correction.",
+        }
+
+    with tempfile.TemporaryDirectory() as directory:
+        result, run_dir = run_deblurring(
+            observation, directory, objective, lambda image: image, corrector,
+            iterations=2, alpha=0.5, max_delta=2 / 255,
+        )
+        assert len(calls) == 2
+        history = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))
+        assert [record["iteration"] for record in history] == [1, 2]
+        assert all(record["applied_delta_linf"] <= 2 / 255 + 1e-6 for record in history)
+        assert all(record["loss_after_qwen"] >= 0 for record in history)
+
+
 def test_patience_resets_and_iteration_cap_wins():
     observation = np.full((1, 1, 3), 0.5, dtype=np.float32)
     unknown = np.ones((1, 1), dtype=bool)
@@ -116,5 +143,6 @@ if __name__ == "__main__":
     test_convergence_signals_are_conjunctive()
     test_run_preserves_known_pixels_and_waits_for_patience()
     test_malformed_edit_is_rejected()
+    test_deblurring_loop_applies_bounded_qwen_edits()
     test_patience_resets_and_iteration_cap_wins()
     print("Offline Qwen inpainting checks passed.")

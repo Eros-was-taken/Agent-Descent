@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-WEIGHTS = Path(__file__).parent / "weights/dncnn_sigma2_lipschitz_color.pth"
+WEIGHTS = Path(__file__).parent / "dncnn_sigma2_lipschitz_color.pth"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-vl:8b"
 NUM_CTX = 16384
@@ -148,6 +148,128 @@ Answer only as JSON with keys "edits" and "explanation".
     except (TypeError, json.JSONDecodeError) as error:
         raise ValueError("Qwen returned invalid JSON.") from error
     return reply
+
+
+def ollama_deblur_corrector(observation, current, step_dir, history,
+                            model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255):
+    height, width, _ = current.shape
+    current_path = step_dir / "current.png"
+    Image.fromarray(np.rint(current * 255).astype(np.uint8)).save(current_path)
+    levels = max(1, round(max_delta * 255))
+    prompt = f"""You are the visual correction step of an image-deblurring experiment.
+Image 1 is the blurred observation. Image 2 is the CURRENT iterate after a
+known-blur data-fidelity gradient step and DnCNN denoising. Both are
+{width}x{height} RGB pixels. Suggest only a few localized rectangular edits
+where the current image visibly needs correction. For each edit return:
+- "bbox_2d": [x1, y1, x2, y2] in relative coordinates 0-1000
+- "delta": [R, G, B] signed increments in 8-bit levels, each between
+  -{levels} and {levels}
+The host applies the edits and enforces the total per-channel bound of
+{max_delta}. Do not invent image details or use external tools. If no edit is
+justified, return an empty edits list. Recent iteration history, oldest first:
+{json.dumps(history)}
+Answer only as JSON with keys "edits" and "explanation".
+"""
+    (step_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    observation_path = step_dir.parent / "observation.png"
+    encoded = [base64.b64encode(path.read_bytes()).decode("ascii")
+               for path in (observation_path, current_path)]
+    body = json.dumps({
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "options": {"num_ctx": num_ctx},
+        "messages": [{"role": "user", "content": prompt, "images": encoded}],
+    }).encode("utf-8")
+    request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        answer = json.loads(response.read())["message"]["content"]
+    (step_dir / "qwen.txt").write_text(answer, encoding="utf-8")
+    try:
+        reply = json.loads(answer)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Qwen returned invalid JSON.") from error
+    return reply
+
+
+def run_deblurring(observation, output, objective, denoiser, corrector, *,
+                   iterations=5, alpha=1.0, max_delta=2 / 255, ground_truth=None,
+                   weights_path=None, corrector_name=MODEL, problem=None):
+    observation = np.asarray(observation, dtype=np.float32)
+    if observation.ndim != 3 or observation.shape[2] != 3 or not np.isfinite(observation).all():
+        raise ValueError("Observation must be a finite RGB image.")
+    if np.any((observation < 0) | (observation > 1)):
+        raise ValueError("Observation must be normalized to [0, 1].")
+    if iterations < 1 or alpha <= 0 or not 0 < max_delta <= 1:
+        raise ValueError("Iterations and alpha must be positive; max_delta must be in (0, 1].")
+    if ground_truth is not None:
+        ground_truth = _checked_image(ground_truth, observation.shape, "Ground truth")
+
+    run_dir = Path(output).resolve() / datetime.now().strftime("run_%Y_%m_%d_%H_%M_%S")
+    run_dir.mkdir(parents=True, exist_ok=False)
+    Image.fromarray(np.rint(observation * 255).astype(np.uint8)).save(run_dir / "observation.png")
+    np.save(run_dir / "observation.npy", observation, allow_pickle=False)
+    weights_path = Path(weights_path) if weights_path is not None else None
+    run_problem = {
+        "task": "known-kernel image deblurring",
+        "fidelity": "0.5 * ||A(x) - observation||_2^2",
+        "corrector": corrector_name,
+        "weights_file": weights_path.name if weights_path else None,
+        "weights_sha256": hashlib.sha256(weights_path.read_bytes()).hexdigest() if weights_path else None,
+    }
+    if problem:
+        run_problem.update(problem)
+    (run_dir / "problem.json").write_text(json.dumps(run_problem, indent=2), encoding="utf-8")
+
+    current = observation.copy()
+    history = []
+    result = current
+    for iteration in range(1, iterations + 1):
+        step_dir = run_dir / f"iteration_{iteration:04d}"
+        step_dir.mkdir()
+        loss_before, gradient = objective(current.copy(), observation.copy())
+        gradient_image = _checked_image(current - alpha * gradient, observation.shape, "Gradient step")
+        candidate = _checked_image(denoiser(gradient_image), observation.shape, "Denoiser output")
+        loss_candidate, _ = objective(candidate.copy(), observation.copy())
+        reply = corrector(observation=observation, current=candidate, step_dir=step_dir, history=history)
+        if not isinstance(reply, dict) or not isinstance(reply.get("edits"), list):
+            raise ValueError("Qwen response must contain an edits list.")
+        delta, proposed_peak = bounded_edit(
+            reply, observation.shape, np.ones(observation.shape[:2], dtype=bool), max_delta
+        )
+        result = np.clip(candidate + delta, 0, 1).astype(np.float32)
+        loss_result, _ = objective(result.copy(), observation.copy())
+        for name, value in {
+            "gradient": gradient_image, "current": candidate,
+            "bounded_delta": delta, "applied_delta": result - candidate, "result": result,
+        }.items():
+            np.save(step_dir / f"{name}.npy", value, allow_pickle=False)
+            preview = value if name in ("gradient", "current", "result") else 0.5 + 0.5 * value / max_delta
+            Image.fromarray(np.rint(np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(step_dir / f"{name}.png")
+        record = {
+            "iteration": iteration,
+            "loss_before_gradient": float(loss_before),
+            "loss_after_denoiser": float(loss_candidate),
+            "loss_after_qwen": float(loss_result),
+            "proposed_delta_linf": proposed_peak,
+            "applied_delta_linf": float(np.abs(result - candidate).max()),
+            "edits": reply["edits"],
+            "reason": reply.get("explanation", ""),
+            "current": f"{step_dir.name}/current.npy",
+            "result": f"{step_dir.name}/result.npy",
+        }
+        if ground_truth is not None:
+            record["psnr_current"] = psnr(candidate, ground_truth)
+            record["psnr_after_qwen"] = psnr(result, ground_truth)
+        (step_dir / "record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+        history = (history + [record])[-10:]
+        (run_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        print(f"Iteration {iteration}/{iterations}: f={loss_result:.6g}", flush=True)
+        current = result
+
+    np.save(run_dir / "result.npy", result, allow_pickle=False)
+    Image.fromarray(np.rint(result * 255).astype(np.uint8)).save(run_dir / "result.png")
+    return result, run_dir
 
 
 def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
@@ -300,9 +422,10 @@ def build_denoiser(weights_path, device):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Qwen-assisted masked image inpainting.")
+    parser = argparse.ArgumentParser(description="Qwen-assisted deblurring or masked inpainting via Ollama.")
     parser.add_argument("image", help="RGB observation image")
-    parser.add_argument("--mask", required=True, help="grayscale mask: white=unknown, black=observed")
+    parser.add_argument("--task", choices=("inpainting", "deblurring"), default="inpainting")
+    parser.add_argument("--mask", help="grayscale inpainting mask: white=unknown, black=observed")
     parser.add_argument("--output", type=Path, default=Path("results"))
     parser.add_argument("--gt", type=Path, help="optional evaluation-only ground truth")
     parser.add_argument("--weights", type=Path, default=WEIGHTS)
@@ -315,27 +438,51 @@ def main(argv=None):
     parser.add_argument("--patience", type=int, default=PATIENCE)
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--kernel", type=Path, help="known 2D blur PSF in .npy format for deblurring")
+    parser.add_argument("--kernel-size", type=int, default=17)
+    parser.add_argument("--blur-sigma", type=float, default=2.5)
+    parser.add_argument("--padding", choices=("circular", "reflect", "replicate"), default="circular")
     args = parser.parse_args(argv)
 
     import torch
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     observation = load_rgb(args.image)
-    unknown_mask = load_unknown_mask(args.mask, observation.shape)
     ground_truth = load_rgb(args.gt) if args.gt else None
     if ground_truth is not None and ground_truth.shape != observation.shape:
         parser.error("Ground truth dimensions must match the observation.")
-    denoiser = build_denoiser(args.weights, device)
-    corrector = lambda **kwargs: ollama_corrector(
-        **kwargs, model=args.model, max_delta=args.max_delta
-    )
-    _, run_dir = run_inpainting(
-        observation, unknown_mask, args.output, denoiser, corrector,
-        iterations=args.iterations, alpha=args.alpha, max_delta=args.max_delta,
-        fidelity_tol=args.fidelity_tol, correction_tol=args.correction_tol,
-        image_tol=args.image_tol, patience=args.patience,
-        ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
-    )
+    if args.task == "deblurring":
+        from pgd_codex import deblurring_operators
+
+        kernel = np.load(args.kernel, allow_pickle=False) if args.kernel else None
+        objective, denoiser, problem = deblurring_operators(
+            kernel=kernel, kernel_size=args.kernel_size, blur_sigma=args.blur_sigma,
+            padding=args.padding, weights=args.weights, device=device,
+        )
+        corrector = lambda **kwargs: ollama_deblur_corrector(
+            **kwargs, model=args.model, max_delta=args.max_delta
+        )
+        _, run_dir = run_deblurring(
+            observation, args.output, objective, denoiser, corrector,
+            iterations=args.iterations, alpha=args.alpha, max_delta=args.max_delta,
+            ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
+            problem=problem,
+        )
+    else:
+        if not args.mask:
+            parser.error("--mask is required for inpainting.")
+        unknown_mask = load_unknown_mask(args.mask, observation.shape)
+        denoiser = build_denoiser(args.weights, device)
+        corrector = lambda **kwargs: ollama_corrector(
+            **kwargs, model=args.model, max_delta=args.max_delta
+        )
+        _, run_dir = run_inpainting(
+            observation, unknown_mask, args.output, denoiser, corrector,
+            iterations=args.iterations, alpha=args.alpha, max_delta=args.max_delta,
+            fidelity_tol=args.fidelity_tol, correction_tol=args.correction_tol,
+            image_tol=args.image_tol, patience=args.patience,
+            ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
+        )
     print(f"Run directory: {run_dir}", flush=True)
 
 

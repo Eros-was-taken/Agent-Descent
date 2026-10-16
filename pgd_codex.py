@@ -52,7 +52,7 @@ def deblurring_operators(*, kernel=None, kernel_size=17, blur_sigma=2.5,
     import deepinv as dinv
     import torch
 
-    weights = Path(weights) if weights else Path(__file__).parent / "weights/dncnn_sigma2_lipschitz_color.pth"
+    weights = Path(weights) if weights else Path(__file__).parent / "dncnn_sigma2_lipschitz_color.pth"
     if not weights.is_file():
         raise FileNotFoundError(f"Missing local DnCNN checkpoint: {weights}")
     if padding not in ("circular", "reflect", "replicate"):

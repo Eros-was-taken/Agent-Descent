@@ -1,4 +1,4 @@
-﻿# Deblurring with DnCNN and terminal Codex
+﻿# Deblurring and inpainting with DnCNN, Ollama, and Qwen
 
 `pgd_codex.py` implements this loop, starting with the blurred observation `x = y`:
 
@@ -26,22 +26,46 @@ how Codex chose the values. The host's gradient and DnCNN steps are unchanged.
 ## Terminal execution
 
 Every iteration invokes **`codex exec`**, using your configured CLI model and
-existing sign-in. There is no API SDK, API-key setup, alternate correction
-backend, or automatic substitute for Codex. A failed CLI call, missing residual,
-invalid array, or timeout stops the loop. A zero residual is valid only if Codex
-explicitly supplies it.
+existing sign-in. This remains available as a deblurring correction backend.
+A failed CLI call, missing residual, invalid array, or timeout stops the loop.
+A zero residual is valid only if Codex explicitly supplies it.
 
 Each invocation is a fresh terminal Codex session with explicit image/history
 context; it is not this desktop chat's live session. The CLI still communicates
 with its model service. The [official CLI documentation](https://learn.chatgpt.com/docs/non-interactive-mode)
 describes this execution mode and reuse of existing authentication.
 
-## Prepared, not run
+## Ollama and Qwen
 
-The code and an offline check have been written. No tests, restoration runs,
-DnCNN inference, or Codex correction calls have been executed. Dependencies
-have not been installed as part of this task. Python, NumPy, Pillow, PyTorch,
-DeepInv, and a signed-in image-capable Codex CLI are required.
+Qwen is the vision-language model; Ollama is the local runtime that downloads
+and serves it over an HTTP API. They are complementary, not alternatives. This
+project uses Ollama so Qwen runs locally without an application API key or
+per-request cloud API setup. The model still needs to be downloaded, and its
+inference uses local compute and memory.
+
+`pgd_qwen.py` sends the observation and current iterate to Qwen through Ollama
+for one bounded correction per iteration. Select `--task deblurring` for the
+known-blur fidelity gradient, or `--task inpainting` for the mask-constrained
+loop (the default). Deblurring reuses the DeepInv blur operator and DnCNN
+checkpoint used by `pgd_codex.py`.
+
+Download the vision model if needed and run the included deblurring example:
+
+```powershell
+ollama pull qwen3-vl:8b
+python pgd_qwen.py blurred.png --task deblurring --iterations 5 --gt gt.png --output results_qwen
+```
+
+The default blur is a 17x17 Gaussian with sigma 2.5 and circular padding.
+Override it with `--blur-sigma`, `--kernel-size`, `--padding`, or a known 2D
+PSF in `.npy` format using `--kernel`. Ollama must be running at
+`http://localhost:11434`; use `--device cuda:0` when a compatible GPU is
+available.
+
+Offline recurrence tests cover both runners. The real image/model restoration
+must still be run. Python, NumPy, Pillow, PyTorch, DeepInv, Ollama, and the Qwen
+model are required; `pgd_codex.py` also requires a signed-in image-capable Codex
+CLI.
 
 For later use, with a **known Gaussian blur** (sigma measured in pixels):
 
@@ -88,7 +112,7 @@ inspection; automatic resume is not implemented.
 
 ## DnCNN checkpoint
 
-Downloaded to `weights/dncnn_sigma2_lipschitz_color.pth` (2,683,949 bytes), using
+Stored at `./dncnn_sigma2_lipschitz_color.pth` (2,683,949 bytes), using
 the same checkpoint that DeepInv selects with `pretrained="download_lipschitz"`.
 It is loaded locally with `torch.load(..., weights_only=True)` and strict state
 matching. A missing checkpoint is an error; there is no runtime download or
@@ -162,7 +186,7 @@ Qwen3-VL requires Ollama 0.12.7 or newer. The 8B model download is about 6.1 GB;
 variant, pass its matching tag with `--model`. The script connects to Ollama at
 `http://localhost:11434`; keep the Ollama app/service running during inference.
 Python dependencies remain those in `requirements.txt`. The DnCNN checkpoint
-must also exist at `weights/dncnn_sigma2_lipschitz_color.pth` or be supplied
+must also exist at `./dncnn_sigma2_lipschitz_color.pth` or be supplied
 with `--weights`.
 
 Provide an RGB observation and a co-sized grayscale mask. White mask pixels
