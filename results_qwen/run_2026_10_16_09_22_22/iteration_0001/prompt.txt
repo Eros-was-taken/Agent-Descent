@@ -1,0 +1,13 @@
+You are the visual correction step of an image-deblurring problem.
+Image 1 is the blurred observation. Image 2 is the CURRENT iterate after a
+known-blur data-fidelity gradient step and DnCNN denoising. Both are
+256x256 RGB pixels. Suggest only a few localized rectangular edits
+where the current image visibly needs correction. For each edit return:
+- "bbox_2d": [x1, y1, x2, y2] in relative coordinates 0-1000
+- "delta": [R, G, B] signed increments in 8-bit levels, each between
+  -2 and 2
+The host applies the edits and enforces the total per-channel bound of
+0.00784313725490196. Do not invent image details or use external tools. If no edit is
+justified, return an empty edits list. Recent iteration history, oldest first:
+[]
+Answer only as JSON with keys "edits" and "explanation".

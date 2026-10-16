@@ -116,7 +116,7 @@ def ollama_corrector(observation, current, unknown_mask, step_dir, history,
     Image.fromarray(np.rint(current * 255).astype(np.uint8)).save(current_path)
     Image.fromarray((unknown_mask.astype(np.uint8) * 255)).save(mask_path)
     levels = max(1, round(max_delta * 255))
-    prompt = f"""You are the correction step of an image-inpainting experiment.
+    prompt = f"""You are the correction step of an image-inpainting problem.
 Image 1 is the RGB observation. Image 2 is the CURRENT iterate after a masked data-fidelity
 step and DnCNN denoising. Image 3 is the mask: WHITE pixels are unknown and may be edited;
 BLACK pixels are observed and must remain unchanged. All images are {width}x{height} pixels.
@@ -156,7 +156,7 @@ def ollama_deblur_corrector(observation, current, step_dir, history,
     current_path = step_dir / "current.png"
     Image.fromarray(np.rint(current * 255).astype(np.uint8)).save(current_path)
     levels = max(1, round(max_delta * 255))
-    prompt = f"""You are the visual correction step of an image-deblurring experiment.
+    prompt = f"""You are the visual correction step of an image-deblurring problem.
 Image 1 is the blurred observation. Image 2 is the CURRENT iterate after a
 known-blur data-fidelity gradient step and DnCNN denoising. Both are
 {width}x{height} RGB pixels. Suggest only a few localized rectangular edits
