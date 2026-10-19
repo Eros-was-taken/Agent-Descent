@@ -47,13 +47,25 @@ inference uses local compute and memory.
 for one bounded correction per iteration. Select `--task deblurring` for the
 known-blur fidelity gradient, or `--task inpainting` for the mask-constrained
 loop (the default). Deblurring reuses the DeepInv blur operator and DnCNN
-checkpoint used by `pgd_codex.py`.
+checkpoint used by `pgd_codex.py`. Runs are grouped under
+`<output>/<image-stem>_<task>/<timestamp>/`, with one `iteration_NNNN` folder
+per completed iteration. Deblurring saves `comparison.png` with the blurred
+input and each completed post-Qwen result. Ollama corrections retry three
+times by default; if all attempts fail, the run stops rather than silently
+substituting an uncorrected iteration. Set `--timeout` and `--retries` to
+adjust those limits. Inpainting retains its convergence-based early stopping.
 
 Download the vision model if needed and run the included deblurring example:
 
 ```powershell
 ollama pull qwen3-vl:8b
-python pgd_qwen.py blurred.png --task deblurring --iterations 5 --gt gt.png --output results_qwen
+python pgd_qwen.py blurred.png --task deblurring --iterations 5 --gt gt.png --output results
+```
+
+Increase the correction timeout or retry count if Ollama is slow to respond:
+
+```powershell
+python pgd_qwen.py blurred.png --task deblurring --iterations 3 --gt gt.png --output results --timeout 900 --retries 5
 ```
 
 The default blur is a 17x17 Gaussian with sigma 2.5 and circular padding.

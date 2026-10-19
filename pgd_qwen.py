@@ -4,18 +4,22 @@ import argparse
 import base64
 import hashlib
 import json
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 WEIGHTS = Path(__file__).parent / "dncnn_sigma2_lipschitz_color.pth"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-vl:8b"
 NUM_CTX = 16384
 TIMEOUT = 600
+OLLAMA_RETRIES = 3
+RETRY_DELAY_SECONDS = 1
 FIDELITY_TOL = 1e-4
 CORRECTION_TOL = 1 / 255
 IMAGE_TOL = 1 / 255
@@ -84,6 +88,62 @@ def bounded_edit(reply, image_shape, unknown_mask, max_delta):
     return delta, peak
 
 
+def ollama_json_chat(prompt, image_paths, step_dir, *, model=MODEL, num_ctx=NUM_CTX,
+                     timeout=TIMEOUT, retries=OLLAMA_RETRIES):
+    if timeout <= 0 or retries < 1:
+        raise ValueError("Ollama timeout and retry count must be positive.")
+    encoded = [base64.b64encode(path.read_bytes()).decode("ascii") for path in image_paths]
+    body = json.dumps({
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "options": {"num_ctx": num_ctx},
+        "messages": [{"role": "user", "content": prompt, "images": encoded}],
+    }).encode("utf-8")
+    request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+    errors = []
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read())
+            answer = payload["message"]["content"]
+            reply = json.loads(answer)
+            if not isinstance(reply, dict) or not isinstance(reply.get("edits"), list):
+                raise ValueError("Qwen response must contain an edits list.")
+            (step_dir / "qwen.txt").write_text(answer, encoding="utf-8")
+            (step_dir / "qwen_retry.log").write_text(
+                "\n".join(errors + [f"Succeeded on attempt {attempt}/{retries}."]), encoding="utf-8"
+            )
+            return reply
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError,
+                KeyError, TypeError, ValueError) as error:
+            last_error = error
+            errors.append(f"Attempt {attempt}/{retries}: {type(error).__name__}: {error}")
+            (step_dir / "qwen_retry.log").write_text("\n".join(errors), encoding="utf-8")
+            if attempt < retries:
+                time.sleep(RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError(f"Qwen correction failed after {retries} attempts. See qwen_retry.log.") from last_error
+
+
+def save_deblurring_comparison(run_dir, observation, iterations):
+    panels = [("Blurred input", run_dir / "observation.png")]
+    panels.extend((f"Iteration {number}", run_dir / f"iteration_{number:04d}" / "result.png")
+                  for number in range(1, iterations + 1))
+    width, height = observation.shape[1], observation.shape[0]
+    label_height = 28
+    rows = (len(panels) + 1) // 2
+    comparison = Image.new("RGB", (2 * width, rows * (height + label_height)), "white")
+    draw = ImageDraw.Draw(comparison)
+    for index, (label, path) in enumerate(panels):
+        column, row = index % 2, index // 2
+        left, top = column * width, row * (height + label_height)
+        draw.text((left + 8, top + 6), label, fill="black")
+        with Image.open(path) as image:
+            comparison.paste(image.convert("RGB"), (left, top + label_height))
+    comparison.save(run_dir / "comparison.png")
+
+
 def convergence_metrics(fidelity, previous_fidelity, applied_delta, image, previous_image,
                         unknown_mask, fidelity_tol, correction_tol, image_tol):
     correction_linf = float(np.abs(applied_delta).max())
@@ -109,7 +169,8 @@ def convergence_metrics(fidelity, previous_fidelity, applied_delta, image, previ
 
 
 def ollama_corrector(observation, current, unknown_mask, step_dir, history,
-                     model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255):
+                     model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255,
+                     timeout=TIMEOUT, retries=OLLAMA_RETRIES):
     height, width, _ = current.shape
     current_path = step_dir / "current.png"
     mask_path = step_dir / "unknown_mask.png"
@@ -131,27 +192,13 @@ Answer only as JSON with keys "edits" and "explanation".
     (step_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     observation_path = step_dir.parent / "observation.png"
     images = [observation_path, current_path, mask_path]
-    encoded = [base64.b64encode(path.read_bytes()).decode("ascii") for path in images]
-    body = json.dumps({
-        "model": model,
-        "stream": False,
-        "format": "json",
-        "options": {"num_ctx": num_ctx},
-        "messages": [{"role": "user", "content": prompt, "images": encoded}],
-    }).encode("utf-8")
-    request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        answer = json.loads(response.read())["message"]["content"]
-    (step_dir / "qwen.txt").write_text(answer, encoding="utf-8")
-    try:
-        reply = json.loads(answer)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError("Qwen returned invalid JSON.") from error
-    return reply
+    return ollama_json_chat(prompt, images, step_dir, model=model, num_ctx=num_ctx,
+                            timeout=timeout, retries=retries)
 
 
 def ollama_deblur_corrector(observation, current, step_dir, history,
-                            model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255):
+                            model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255,
+                            timeout=TIMEOUT, retries=OLLAMA_RETRIES):
     height, width, _ = current.shape
     current_path = step_dir / "current.png"
     Image.fromarray(np.rint(current * 255).astype(np.uint8)).save(current_path)
@@ -172,29 +219,13 @@ Answer only as JSON with keys "edits" and "explanation".
 """
     (step_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     observation_path = step_dir.parent / "observation.png"
-    encoded = [base64.b64encode(path.read_bytes()).decode("ascii")
-               for path in (observation_path, current_path)]
-    body = json.dumps({
-        "model": model,
-        "stream": False,
-        "format": "json",
-        "options": {"num_ctx": num_ctx},
-        "messages": [{"role": "user", "content": prompt, "images": encoded}],
-    }).encode("utf-8")
-    request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        answer = json.loads(response.read())["message"]["content"]
-    (step_dir / "qwen.txt").write_text(answer, encoding="utf-8")
-    try:
-        reply = json.loads(answer)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError("Qwen returned invalid JSON.") from error
-    return reply
+    return ollama_json_chat(prompt, (observation_path, current_path), step_dir,
+                            model=model, num_ctx=num_ctx, timeout=timeout, retries=retries)
 
 
 def run_deblurring(observation, output, objective, denoiser, corrector, *,
                    iterations=5, alpha=1.0, max_delta=2 / 255, ground_truth=None,
-                   weights_path=None, corrector_name=MODEL, problem=None):
+                   weights_path=None, corrector_name=MODEL, problem=None, run_name=None):
     observation = np.asarray(observation, dtype=np.float32)
     if observation.ndim != 3 or observation.shape[2] != 3 or not np.isfinite(observation).all():
         raise ValueError("Observation must be a finite RGB image.")
@@ -205,8 +236,12 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
     if ground_truth is not None:
         ground_truth = _checked_image(ground_truth, observation.shape, "Ground truth")
 
-    run_dir = Path(output).resolve() / datetime.now().strftime("run_%Y_%m_%d_%H_%M_%S")
+    output_dir = Path(output).resolve()
+    if run_name:
+        output_dir /= run_name
+    run_dir = output_dir / datetime.now().strftime("run_%Y_%m_%d_%H_%M_%S")
     run_dir.mkdir(parents=True, exist_ok=False)
+    print(f"Run directory: {run_dir}", flush=True)
     Image.fromarray(np.rint(observation * 255).astype(np.uint8)).save(run_dir / "observation.png")
     np.save(run_dir / "observation.npy", observation, allow_pickle=False)
     weights_path = Path(weights_path) if weights_path is not None else None
@@ -231,7 +266,8 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
         gradient_image = _checked_image(current - alpha * gradient, observation.shape, "Gradient step")
         candidate = _checked_image(denoiser(gradient_image), observation.shape, "Denoiser output")
         loss_candidate, _ = objective(candidate.copy(), observation.copy())
-        reply = corrector(observation=observation, current=candidate, step_dir=step_dir, history=history)
+        reply = corrector(observation=observation, current=candidate,
+                          step_dir=step_dir, history=history)
         if not isinstance(reply, dict) or not isinstance(reply.get("edits"), list):
             raise ValueError("Qwen response must contain an edits list.")
         delta, proposed_peak = bounded_edit(
@@ -265,6 +301,7 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
         history = (history + [record])[-10:]
         (run_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
         print(f"Iteration {iteration}/{iterations}: f={loss_result:.6g}", flush=True)
+        save_deblurring_comparison(run_dir, observation, iteration)
         current = result
 
     np.save(run_dir / "result.npy", result, allow_pickle=False)
@@ -276,7 +313,7 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
                    iterations=5, alpha=1.0, max_delta=2 / 255,
                    fidelity_tol=FIDELITY_TOL, correction_tol=CORRECTION_TOL,
                    image_tol=IMAGE_TOL, patience=PATIENCE, ground_truth=None,
-                   weights_path=None, corrector_name=MODEL):
+                   weights_path=None, corrector_name=MODEL, run_name=None):
     observation = np.asarray(observation, dtype=np.float32)
     if observation.ndim != 3 or observation.shape[2] != 3 or not np.isfinite(observation).all():
         raise ValueError("Observation must be a finite RGB image.")
@@ -292,8 +329,12 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
         ground_truth = _checked_image(ground_truth, observation.shape, "Ground truth")
 
     known_mask = ~unknown_mask
-    run_dir = Path(output).resolve() / datetime.now().strftime("run_%Y_%m_%d_%H_%M_%S")
+    output_dir = Path(output).resolve()
+    if run_name:
+        output_dir /= run_name
+    run_dir = output_dir / datetime.now().strftime("run_%Y_%m_%d_%H_%M_%S")
     run_dir.mkdir(parents=True, exist_ok=False)
+    print(f"Run directory: {run_dir}", flush=True)
     Image.fromarray(np.rint(observation * 255).astype(np.uint8)).save(run_dir / "observation.png")
     Image.fromarray(unknown_mask.astype(np.uint8) * 255).save(run_dir / "unknown_mask.png")
     np.save(run_dir / "observation.npy", observation, allow_pickle=False)
@@ -430,6 +471,8 @@ def main(argv=None):
     parser.add_argument("--gt", type=Path, help="optional evaluation-only ground truth")
     parser.add_argument("--weights", type=Path, default=WEIGHTS)
     parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--timeout", type=float, default=TIMEOUT, help="Seconds allowed per Ollama correction attempt.")
+    parser.add_argument("--retries", type=int, default=OLLAMA_RETRIES, help="Attempts per Qwen correction before stopping.")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--max-delta", type=float, default=2 / 255)
     parser.add_argument("--fidelity-tol", type=float, default=FIDELITY_TOL)
@@ -460,13 +503,14 @@ def main(argv=None):
             padding=args.padding, weights=args.weights, device=device,
         )
         corrector = lambda **kwargs: ollama_deblur_corrector(
-            **kwargs, model=args.model, max_delta=args.max_delta
+            **kwargs, model=args.model, max_delta=args.max_delta,
+            timeout=args.timeout, retries=args.retries,
         )
         _, run_dir = run_deblurring(
             observation, args.output, objective, denoiser, corrector,
             iterations=args.iterations, alpha=args.alpha, max_delta=args.max_delta,
             ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
-            problem=problem,
+            problem=problem, run_name=f"{Path(args.image).stem}_deblurring",
         )
     else:
         if not args.mask:
@@ -474,7 +518,8 @@ def main(argv=None):
         unknown_mask = load_unknown_mask(args.mask, observation.shape)
         denoiser = build_denoiser(args.weights, device)
         corrector = lambda **kwargs: ollama_corrector(
-            **kwargs, model=args.model, max_delta=args.max_delta
+            **kwargs, model=args.model, max_delta=args.max_delta,
+            timeout=args.timeout, retries=args.retries,
         )
         _, run_dir = run_inpainting(
             observation, unknown_mask, args.output, denoiser, corrector,
@@ -482,6 +527,7 @@ def main(argv=None):
             fidelity_tol=args.fidelity_tol, correction_tol=args.correction_tol,
             image_tol=args.image_tol, patience=args.patience,
             ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
+            run_name=f"{Path(args.image).stem}_inpainting",
         )
     print(f"Run directory: {run_dir}", flush=True)
 

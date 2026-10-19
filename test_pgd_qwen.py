@@ -1,13 +1,15 @@
 """Offline tests for mask-aware Qwen inpainting and convergence stopping."""
 
 import json
+import io
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from pgd_qwen import (bounded_edit, convergence_metrics, load_unknown_mask,
-                      run_deblurring, run_inpainting)
+                      ollama_json_chat, run_deblurring, run_inpainting)
 
 
 def test_mask_loading_and_bounded_edits():
@@ -111,6 +113,68 @@ def test_deblurring_loop_applies_bounded_qwen_edits():
         assert [record["iteration"] for record in history] == [1, 2]
         assert all(record["applied_delta_linf"] <= 2 / 255 + 1e-6 for record in history)
         assert all(record["loss_after_qwen"] >= 0 for record in history)
+        from PIL import Image
+
+        with Image.open(run_dir / "comparison.png") as comparison:
+            assert comparison.size == (4, 60)
+
+
+def test_ollama_retries_then_returns_valid_correction():
+    with tempfile.TemporaryDirectory() as directory:
+        step_dir = Path(directory)
+        image_path = step_dir / "input.png"
+        from PIL import Image
+
+        Image.new("RGB", (1, 1)).save(image_path)
+        answer = json.dumps({"edits": [], "explanation": "No edit needed."})
+        response = io.BytesIO(json.dumps({"message": {"content": answer}}).encode("utf-8"))
+        with patch("pgd_qwen.urllib.request.urlopen", side_effect=[TimeoutError("busy"), response]), \
+                patch("pgd_qwen.time.sleep") as sleep:
+            reply = ollama_json_chat("prompt", [image_path], step_dir, retries=2)
+        assert reply["edits"] == []
+        sleep.assert_called_once()
+        assert "Succeeded on attempt 2/2" in (step_dir / "qwen_retry.log").read_text(encoding="utf-8")
+
+
+def test_ollama_reports_exhausted_retries():
+    with tempfile.TemporaryDirectory() as directory:
+        step_dir = Path(directory)
+        image_path = step_dir / "input.png"
+        from PIL import Image
+
+        Image.new("RGB", (1, 1)).save(image_path)
+        with patch("pgd_qwen.urllib.request.urlopen", side_effect=TimeoutError("Ollama busy")), \
+                patch("pgd_qwen.time.sleep"):
+            try:
+                ollama_json_chat("prompt", [image_path], step_dir, retries=2)
+            except RuntimeError as error:
+                assert "failed after 2 attempts" in str(error)
+            else:
+                raise AssertionError("Exhausted retries did not fail.")
+        log = (step_dir / "qwen_retry.log").read_text(encoding="utf-8")
+        assert "Ollama busy" in log
+        assert log.count("Attempt") == 2
+
+
+def test_deblurring_does_not_claim_success_after_correction_failure():
+    observation = np.full((2, 2, 3), 0.5, dtype=np.float32)
+    calls = []
+
+    def corrector(**kwargs):
+        calls.append(kwargs["step_dir"])
+        raise TimeoutError("Ollama timed out")
+
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            run_deblurring(
+                observation, directory, lambda image, observed: (0.0, np.zeros_like(image)),
+                lambda image: image, corrector, iterations=3, run_name="sample_deblurring",
+            )
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("A failed correction was silently accepted.")
+        assert len(calls) == 1
 
 
 def test_patience_resets_and_iteration_cap_wins():
@@ -144,5 +208,8 @@ if __name__ == "__main__":
     test_run_preserves_known_pixels_and_waits_for_patience()
     test_malformed_edit_is_rejected()
     test_deblurring_loop_applies_bounded_qwen_edits()
+    test_ollama_retries_then_returns_valid_correction()
+    test_ollama_reports_exhausted_retries()
+    test_deblurring_does_not_claim_success_after_correction_failure()
     test_patience_resets_and_iteration_cap_wins()
     print("Offline Qwen inpainting checks passed.")
