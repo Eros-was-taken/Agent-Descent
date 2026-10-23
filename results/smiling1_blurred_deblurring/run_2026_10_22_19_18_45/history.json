@@ -1,0 +1,30 @@
+[
+  {
+    "iteration": 1,
+    "loss_before_gradient": 53.62511415577362,
+    "loss_after_denoiser": 22.845030535245318,
+    "loss_after_qwen": 22.98537415906229,
+    "proposed_delta_linf": 0.003921568859368563,
+    "applied_delta_linf": 0.003921568393707275,
+    "edits": [
+      {
+        "bbox_2d": [
+          250,
+          350,
+          400,
+          500
+        ],
+        "delta": [
+          -1,
+          -1,
+          -1
+        ]
+      }
+    ],
+    "reason": "The current reconstruction shows the mouth region (teeth) slightly overexposed compared to the blurred observation. Reducing R, G, B by 1 in this localized area corrects the visible overexposure without inventing details.",
+    "current": "iteration_0001/current.npy",
+    "result": "iteration_0001/result.npy",
+    "psnr_current": 27.111383067172426,
+    "psnr_after_qwen": 27.11056666969107
+  }
+]

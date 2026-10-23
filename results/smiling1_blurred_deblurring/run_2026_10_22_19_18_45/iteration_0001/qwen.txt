@@ -1,0 +1,9 @@
+{
+  "edits": [
+    {
+      "bbox_2d": [250, 350, 400, 500],
+      "delta": [-1, -1, -1]
+    }
+  ],
+  "explanation": "The current reconstruction shows the mouth region (teeth) slightly overexposed compared to the blurred observation. Reducing R, G, B by 1 in this localized area corrects the visible overexposure without inventing details."
+}

@@ -1,7 +1,7 @@
 {
   "task": "known-kernel image deblurring",
   "fidelity": "0.5 * ||A(x) - observation||_2^2",
-  "corrector": "qwen3-vl:8b",
+  "corrector": "qwen3-vl:8b-restoration",
   "weights_file": "dncnn_sigma2_lipschitz_color.pth",
   "weights_sha256": "807b47af4b851f3142c2d4a1a11aef3355ae7e191b0173e4f701790fcf2264b6",
   "f": "0.5 * ||A(x) - y||_2^2 (sum, not mean)",
