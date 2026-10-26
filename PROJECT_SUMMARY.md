@@ -227,6 +227,16 @@ Deblurring (mask is not used):
 python pgd_qwen.py blurred.png --task deblurring --output results --iterations 5 --gt gt.png
 ```
 
+To use a dynamic sampling temperature, provide a high and low value in `[0, 1]`:
+
+```powershell
+python pgd_qwen.py blurred.png --task deblurring --iterations 20 --dynamic-temperature --temperature-range 0.9 0.2
+```
+
+The high value is used during the first 20% of iterations, then decreases
+linearly to the low value at the final iteration. When the flag is omitted,
+Ollama's configured/default temperature remains in effect.
+
 ### Codex CLI
 
 ```powershell
@@ -270,6 +280,8 @@ is fixed by the bundled weights; there is no runtime noise-level option.
 | `--image-tol` | Nonnegative number | `1/255` (`~0.003922`) | Inpainting unknown-region RMS image-change tolerance; unused for deblurring. |
 | `--patience` | Positive integer | `2` | Consecutive inpainting iterations required to meet all stopping tolerances; unused for deblurring. |
 | `--model` | Ollama model tag | `qwen3-vl:8b` | Local model name, e.g. another installed Qwen3-VL size. |
+| `--dynamic-temperature` | Boolean flag | Disabled | Apply a high-to-low sampling temperature schedule to Qwen corrections through Ollama. |
+| `--temperature-range` | Two numbers in `[0,1]` | `0.9 0.2` | High and low values; high must be at least low. Used only with `--dynamic-temperature`. |
 | `--device` | PyTorch device string | Auto | Defaults to `cuda:0` if available, otherwise `cpu`; can be set explicitly. |
 | `--kernel` | Path to `.npy` | None | Optional known 2D blur PSF for deblurring; odd dimensions, nonnegative values and positive sum are required; host normalizes its sum. If supplied, it takes precedence over Gaussian settings. |
 | `--kernel-size` | Positive odd integer | `17` | Gaussian PSF width/height used when no explicit PSF is supplied. |

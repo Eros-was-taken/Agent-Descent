@@ -9,7 +9,8 @@ from unittest.mock import patch
 import numpy as np
 
 from pgd_qwen import (bounded_edit, convergence_metrics, load_unknown_mask,
-                      ollama_json_chat, run_deblurring, run_inpainting)
+                      iteration_temperature, ollama_json_chat, run_deblurring,
+                      run_inpainting, validate_temperature_range)
 
 
 def test_mask_loading_and_bounded_edits():
@@ -47,6 +48,23 @@ def test_convergence_signals_are_conjunctive():
     assert not image_fails["all_converged"] and not image_fails["image_stable"]
 
 
+def test_dynamic_temperature_schedule_and_validation():
+    temperatures = [
+        iteration_temperature(iteration, 5, True, (0.9, 0.2))
+        for iteration in range(1, 6)
+    ]
+    np.testing.assert_allclose(temperatures, [0.9, 0.725, 0.55, 0.375, 0.2])
+    assert iteration_temperature(1, 5, False, (0.9, 0.2)) is None
+    assert iteration_temperature(1, 1, True, (1, 0)) == 1
+    for invalid in ((-0.1, 0.1), (0.8, 1.1), (0.2, 0.8), (float("nan"), 0.1)):
+        try:
+            validate_temperature_range(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Invalid temperature range was accepted: {invalid}")
+
+
 def test_run_preserves_known_pixels_and_waits_for_patience():
     observation = np.full((2, 2, 3), 0.5, dtype=np.float32)
     unknown = np.array([[True, False], [False, False]])
@@ -56,16 +74,18 @@ def test_run_preserves_known_pixels_and_waits_for_patience():
         return np.full_like(image, 0.6)
 
     def corrector(**kwargs):
-        calls.append(kwargs["current"].copy())
+        calls.append(kwargs.get("temperature"))
         return {"edits": [], "explanation": "No change needed."}
 
     with tempfile.TemporaryDirectory() as directory:
         result, run_dir = run_inpainting(
             observation, unknown, directory, denoiser, corrector,
-            iterations=6, patience=2,
+            iterations=6, patience=2, dynamic_temperature=True,
+            temperature_range=(0.9, 0.2),
         )
         np.testing.assert_array_equal(result[~unknown], observation[~unknown])
         assert len(calls) == 3
+        np.testing.assert_allclose(calls, [0.9, 0.9, 0.725])
         history = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))
         assert [record["iteration"] for record in history] == [1, 2, 3]
         assert history[-1]["consecutive_converged_iterations"] == 2
@@ -128,12 +148,45 @@ def test_ollama_retries_then_returns_valid_correction():
         Image.new("RGB", (1, 1)).save(image_path)
         answer = json.dumps({"edits": [], "explanation": "No edit needed."})
         response = io.BytesIO(json.dumps({"message": {"content": answer}}).encode("utf-8"))
-        with patch("pgd_qwen.urllib.request.urlopen", side_effect=[TimeoutError("busy"), response]), \
+        with patch("pgd_qwen.urllib.request.urlopen", side_effect=[TimeoutError("busy"), response]) as urlopen, \
                 patch("pgd_qwen.time.sleep") as sleep:
             reply = ollama_json_chat("prompt", [image_path], step_dir, retries=2)
         assert reply["edits"] == []
+        assert "temperature" not in json.loads(urlopen.call_args.args[0].data)["options"]
         sleep.assert_called_once()
         assert "Succeeded on attempt 2/2" in (step_dir / "qwen_retry.log").read_text(encoding="utf-8")
+
+
+def test_ollama_receives_temperature_and_deblurring_schedule():
+    observation = np.full((1, 1, 3), 0.5, dtype=np.float32)
+    temperatures = []
+
+    def corrector(**kwargs):
+        temperatures.append(kwargs["temperature"])
+        return {"edits": []}
+
+    with tempfile.TemporaryDirectory() as directory:
+        run_deblurring(
+            observation, directory,
+            lambda image, observed: (0.0, np.zeros_like(image)),
+            lambda image: image, corrector, iterations=5,
+            dynamic_temperature=True, temperature_range=(0.9, 0.2),
+        )
+    np.testing.assert_allclose(temperatures, [0.9, 0.725, 0.55, 0.375, 0.2])
+
+    with tempfile.TemporaryDirectory() as directory:
+        step_dir = Path(directory)
+        image_path = step_dir / "input.png"
+        from PIL import Image
+
+        Image.new("RGB", (1, 1)).save(image_path)
+        response = io.BytesIO(json.dumps({
+            "message": {"content": json.dumps({"edits": []})}
+        }).encode("utf-8"))
+        with patch("pgd_qwen.urllib.request.urlopen", return_value=response) as urlopen:
+            ollama_json_chat("prompt", [image_path], step_dir, temperature=0.65)
+        request_body = json.loads(urlopen.call_args.args[0].data)
+        assert request_body["options"]["temperature"] == 0.65
 
 
 def test_ollama_reports_exhausted_retries():

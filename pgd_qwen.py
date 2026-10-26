@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +25,7 @@ FIDELITY_TOL = 1e-4
 CORRECTION_TOL = 1 / 255
 IMAGE_TOL = 1 / 255
 PATIENCE = 2
+TEMPERATURE_RANGE = (0.9, 0.2)
 
 
 def load_rgb(path):
@@ -59,6 +61,38 @@ def _checked_image(image, expected_shape, label):
     return np.clip(image, 0, 1)
 
 
+def validate_temperature_range(temperature_range):
+    try:
+        high, low = temperature_range
+    except (TypeError, ValueError) as error:
+        raise ValueError("Temperature range must contain exactly two values: high and low.") from error
+    values = (high, low)
+    if (any(isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating))
+            for value in values)
+            or not all(math.isfinite(float(value)) and 0 <= value <= 1 for value in values)
+            or high < low):
+        raise ValueError("Temperature range must satisfy 0 <= low <= high <= 1.")
+    return float(high), float(low)
+
+
+def iteration_temperature(iteration, iterations, dynamic_temperature, temperature_range):
+    high, low = validate_temperature_range(temperature_range)
+    if not isinstance(dynamic_temperature, bool):
+        raise ValueError("dynamic_temperature must be a boolean.")
+    if not dynamic_temperature:
+        return None
+    if (isinstance(iteration, bool) or not isinstance(iteration, int)
+            or isinstance(iterations, bool) or not isinstance(iterations, int)
+            or iterations < 1 or not 1 <= iteration <= iterations):
+        raise ValueError("Iteration must be between 1 and the positive iteration count.")
+
+    warmup_iterations = max(1, math.ceil(iterations * 0.2))
+    if iteration <= warmup_iterations:
+        return high
+    progress = (iteration - warmup_iterations) / (iterations - warmup_iterations)
+    return high + (low - high) * progress
+
+
 def bounded_edit(reply, image_shape, unknown_mask, max_delta):
     if not isinstance(reply, dict) or not isinstance(reply.get("edits"), list):
         raise ValueError("Qwen response must contain an edits list.")
@@ -89,15 +123,26 @@ def bounded_edit(reply, image_shape, unknown_mask, max_delta):
 
 
 def ollama_json_chat(prompt, image_paths, step_dir, *, model=MODEL, num_ctx=NUM_CTX,
-                     timeout=TIMEOUT, retries=OLLAMA_RETRIES):
+                     timeout=TIMEOUT, retries=OLLAMA_RETRIES, temperature=None):
     if timeout <= 0 or retries < 1:
         raise ValueError("Ollama timeout and retry count must be positive.")
+    if temperature is not None and (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(temperature))
+            or not 0 <= temperature <= 1):
+        raise ValueError("Temperature must be a finite number in [0, 1].")
+    if temperature is not None:
+        temperature = float(temperature)
     encoded = [base64.b64encode(path.read_bytes()).decode("ascii") for path in image_paths]
+    options = {"num_ctx": num_ctx}
+    if temperature is not None:
+        options["temperature"] = temperature
     body = json.dumps({
         "model": model,
         "stream": False,
         "format": "json",
-        "options": {"num_ctx": num_ctx},
+        "options": options,
         "messages": [{"role": "user", "content": prompt, "images": encoded}],
     }).encode("utf-8")
     request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
@@ -170,7 +215,7 @@ def convergence_metrics(fidelity, previous_fidelity, applied_delta, image, previ
 
 def ollama_corrector(observation, current, unknown_mask, step_dir, history,
                      model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255,
-                     timeout=TIMEOUT, retries=OLLAMA_RETRIES):
+                     timeout=TIMEOUT, retries=OLLAMA_RETRIES, temperature=None):
     height, width, _ = current.shape
     current_path = step_dir / "current.png"
     mask_path = step_dir / "unknown_mask.png"
@@ -193,12 +238,12 @@ Answer only as JSON with keys "edits" and "explanation".
     observation_path = step_dir.parent / "observation.png"
     images = [observation_path, current_path, mask_path]
     return ollama_json_chat(prompt, images, step_dir, model=model, num_ctx=num_ctx,
-                            timeout=timeout, retries=retries)
+                            timeout=timeout, retries=retries, temperature=temperature)
 
 
 def ollama_deblur_corrector(observation, current, step_dir, history,
                             model=MODEL, num_ctx=NUM_CTX, max_delta=2 / 255,
-                            timeout=TIMEOUT, retries=OLLAMA_RETRIES):
+                            timeout=TIMEOUT, retries=OLLAMA_RETRIES, temperature=None):
     height, width, _ = current.shape
     current_path = step_dir / "current.png"
     Image.fromarray(np.rint(current * 255).astype(np.uint8)).save(current_path)
@@ -220,12 +265,14 @@ Answer only as JSON with keys "edits" and "explanation".
     (step_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     observation_path = step_dir.parent / "observation.png"
     return ollama_json_chat(prompt, (observation_path, current_path), step_dir,
-                            model=model, num_ctx=num_ctx, timeout=timeout, retries=retries)
+                            model=model, num_ctx=num_ctx, timeout=timeout, retries=retries,
+                            temperature=temperature)
 
 
 def run_deblurring(observation, output, objective, denoiser, corrector, *,
                    iterations=5, alpha=1.0, max_delta=2 / 255, ground_truth=None,
-                   weights_path=None, corrector_name=MODEL, problem=None, run_name=None):
+                   weights_path=None, corrector_name=MODEL, problem=None, run_name=None,
+                   dynamic_temperature=False, temperature_range=TEMPERATURE_RANGE):
     observation = np.asarray(observation, dtype=np.float32)
     if observation.ndim != 3 or observation.shape[2] != 3 or not np.isfinite(observation).all():
         raise ValueError("Observation must be a finite RGB image.")
@@ -233,6 +280,9 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
         raise ValueError("Observation must be normalized to [0, 1].")
     if iterations < 1 or alpha <= 0 or not 0 < max_delta <= 1:
         raise ValueError("Iterations and alpha must be positive; max_delta must be in (0, 1].")
+    temperature_range = validate_temperature_range(temperature_range)
+    if not isinstance(dynamic_temperature, bool):
+        raise ValueError("dynamic_temperature must be a boolean.")
     if ground_truth is not None:
         ground_truth = _checked_image(ground_truth, observation.shape, "Ground truth")
 
@@ -249,6 +299,8 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
         "task": "known-kernel image deblurring",
         "fidelity": "0.5 * ||A(x) - observation||_2^2",
         "corrector": corrector_name,
+        "dynamic_temperature": dynamic_temperature,
+        "temperature_range": list(temperature_range),
         "weights_file": weights_path.name if weights_path else None,
         "weights_sha256": hashlib.sha256(weights_path.read_bytes()).hexdigest() if weights_path else None,
     }
@@ -266,8 +318,16 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
         gradient_image = _checked_image(current - alpha * gradient, observation.shape, "Gradient step")
         candidate = _checked_image(denoiser(gradient_image), observation.shape, "Denoiser output")
         loss_candidate, _ = objective(candidate.copy(), observation.copy())
-        reply = corrector(observation=observation, current=candidate,
-                          step_dir=step_dir, history=history)
+        temperature = iteration_temperature(
+            iteration, iterations, dynamic_temperature, temperature_range
+        )
+        corrector_kwargs = {
+            "observation": observation, "current": candidate,
+            "step_dir": step_dir, "history": history,
+        }
+        if temperature is not None:
+            corrector_kwargs["temperature"] = temperature
+        reply = corrector(**corrector_kwargs)
         if not isinstance(reply, dict) or not isinstance(reply.get("edits"), list):
             raise ValueError("Qwen response must contain an edits list.")
         delta, proposed_peak = bounded_edit(
@@ -284,6 +344,7 @@ def run_deblurring(observation, output, objective, denoiser, corrector, *,
             Image.fromarray(np.rint(np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(step_dir / f"{name}.png")
         record = {
             "iteration": iteration,
+            "temperature": temperature,
             "loss_before_gradient": float(loss_before),
             "loss_after_denoiser": float(loss_candidate),
             "loss_after_qwen": float(loss_result),
@@ -313,7 +374,8 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
                    iterations=5, alpha=1.0, max_delta=2 / 255,
                    fidelity_tol=FIDELITY_TOL, correction_tol=CORRECTION_TOL,
                    image_tol=IMAGE_TOL, patience=PATIENCE, ground_truth=None,
-                   weights_path=None, corrector_name=MODEL, run_name=None):
+                   weights_path=None, corrector_name=MODEL, run_name=None,
+                   dynamic_temperature=False, temperature_range=TEMPERATURE_RANGE):
     observation = np.asarray(observation, dtype=np.float32)
     if observation.ndim != 3 or observation.shape[2] != 3 or not np.isfinite(observation).all():
         raise ValueError("Observation must be a finite RGB image.")
@@ -325,6 +387,9 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
         raise ValueError("Iterations, patience, and max_delta must be positive; alpha cannot be negative.")
     if min(fidelity_tol, correction_tol, image_tol) < 0:
         raise ValueError("Convergence tolerances cannot be negative.")
+    temperature_range = validate_temperature_range(temperature_range)
+    if not isinstance(dynamic_temperature, bool):
+        raise ValueError("dynamic_temperature must be a boolean.")
     if ground_truth is not None:
         ground_truth = _checked_image(ground_truth, observation.shape, "Ground truth")
 
@@ -351,6 +416,8 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
         "fidelity": "0.5 * sum((known_mask * (x - observation))**2)",
         "fidelity_for_stopping": "DnCNN candidate before exact known-pixel projection",
         "corrector": corrector_name,
+        "dynamic_temperature": dynamic_temperature,
+        "temperature_range": list(temperature_range),
         "weights_file": weights_name,
         "weights_sha256": weights_hash,
         "stop": {
@@ -377,8 +444,16 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
         candidate = _checked_image(denoiser(gradient), observation.shape, "Denoiser output")
         candidate_fidelity = masked_fidelity(candidate, observation, known_mask)
         denoised = np.where(known_mask[..., None], observation, candidate)
-        reply = corrector(observation=observation, current=denoised,
-                          unknown_mask=unknown_mask, step_dir=step_dir, history=history)
+        temperature = iteration_temperature(
+            iteration, iterations, dynamic_temperature, temperature_range
+        )
+        corrector_kwargs = {
+            "observation": observation, "current": denoised,
+            "unknown_mask": unknown_mask, "step_dir": step_dir, "history": history,
+        }
+        if temperature is not None:
+            corrector_kwargs["temperature"] = temperature
+        reply = corrector(**corrector_kwargs)
         delta, proposed_peak = bounded_edit(reply, observation.shape, unknown_mask, max_delta)
         result = np.clip(denoised + delta, 0, 1)
         result = np.where(known_mask[..., None], observation, result).astype(np.float32)
@@ -407,6 +482,7 @@ def run_inpainting(observation, unknown_mask, output, denoiser, corrector, *,
 
         record = {
             "iteration": iteration,
+            "temperature": temperature,
             "fidelity_before_projection": candidate_fidelity,
             "fidelity_after_projection": result_fidelity,
             "edits": reply["edits"],
@@ -480,12 +556,21 @@ def main(argv=None):
     parser.add_argument("--image-tol", type=float, default=IMAGE_TOL)
     parser.add_argument("--patience", type=int, default=PATIENCE)
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--dynamic-temperature", action="store_true",
+                        help="Use a high-to-low temperature schedule for Qwen corrections.")
+    parser.add_argument("--temperature-range", type=float, nargs=2, metavar=("HIGH", "LOW"),
+                        default=TEMPERATURE_RANGE,
+                        help="Dynamic temperature high and low values in [0, 1] (default: 0.9 0.2).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--kernel", type=Path, help="known 2D blur PSF in .npy format for deblurring")
     parser.add_argument("--kernel-size", type=int, default=17)
     parser.add_argument("--blur-sigma", type=float, default=2.5)
     parser.add_argument("--padding", choices=("circular", "reflect", "replicate"), default="circular")
     args = parser.parse_args(argv)
+    try:
+        args.temperature_range = validate_temperature_range(args.temperature_range)
+    except ValueError as error:
+        parser.error(str(error))
 
     import torch
 
@@ -511,6 +596,8 @@ def main(argv=None):
             iterations=args.iterations, alpha=args.alpha, max_delta=args.max_delta,
             ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
             problem=problem, run_name=f"{Path(args.image).stem}_deblurring",
+            dynamic_temperature=args.dynamic_temperature,
+            temperature_range=args.temperature_range,
         )
     else:
         if not args.mask:
@@ -528,6 +615,8 @@ def main(argv=None):
             image_tol=args.image_tol, patience=args.patience,
             ground_truth=ground_truth, weights_path=args.weights, corrector_name=args.model,
             run_name=f"{Path(args.image).stem}_inpainting",
+            dynamic_temperature=args.dynamic_temperature,
+            temperature_range=args.temperature_range,
         )
     print(f"Run directory: {run_dir}", flush=True)
 

@@ -68,6 +68,19 @@ Increase the correction timeout or retry count if Ollama is slow to respond:
 python pgd_qwen.py blurred.png --task deblurring --iterations 3 --gt gt.png --output results --timeout 900 --retries 5
 ```
 
+Enable dynamic Qwen sampling temperature with `--dynamic-temperature` and set
+the high and low values using `--temperature-range HIGH LOW`. Both values must
+be in `[0, 1]` and the high value must be at least the low value. The high
+temperature is used for the first 20% of iterations, then decreases linearly
+to the low temperature on the final iteration:
+
+```powershell
+python pgd_qwen.py blurred.png --task deblurring --iterations 20 --dynamic-temperature --temperature-range 0.9 0.2
+```
+
+Without `--dynamic-temperature`, Ollama's configured/default temperature is
+unchanged. This setting applies to Qwen requests sent through Ollama.
+
 The default blur is a 17x17 Gaussian with sigma 2.5 and circular padding.
 Override it with `--blur-sigma`, `--kernel-size`, `--padding`, or a known 2D
 PSF in `.npy` format using `--kernel`. Ollama must be running at
